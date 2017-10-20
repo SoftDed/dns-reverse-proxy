@@ -1,71 +1,53 @@
-/*
-Binary dns_reverse_proxy is a DNS reverse proxy to route queries to DNS servers.
-
-To illustrate, imagine an HTTP reverse proxy but for DNS.
-It listens on both TCP/UDP IPv4/IPv6 on specified port.
-Since the upstream servers will not see the real client IPs but the proxy,
-you can specify a list of IPs allowed to transfer (AXFR/IXFR).
-
-Example usage:
-        $ go run dns_reverse_proxy.go -address :53 \
-                -default 8.8.8.8:53 \
-                -route .example.com.=8.8.4.4:53 \
-                -allow-transfer 1.2.3.4,::1
-
-A query for example.net or example.com will go to 8.8.8.8:53, the default.
-However, a query for subdomain.example.com will go to 8.8.4.4:53.
-*/
 package main
 
 import (
 	"flag"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/miekg/dns"
+	"gopkg.in/yaml.v2"
 )
 
 var (
-	address = flag.String("address", ":53", "Address to listen to (TCP and UDP)")
-
-	defaultServer = flag.String("default", "",
-		"Default DNS server where to send queries if no route matched (IP:port)")
-
-	routeList = flag.String("route", "",
-		"List of routes where to send queries (subdomain=IP:port)")
-	routes map[string]string
-
-	allowTransfer = flag.String("allow-transfer", "",
-		"List of IPs allowed to transfer (AXFR/IXFR)")
-	transferIPs []string
+	configFile = flag.String("config", "/etc/dns-proxy.yaml", "The path to the file containing the list of routes and allow transfers")
+	bind       = flag.String("bind", "127.0.0.1:53", "IP:PORT bind proxy")
+	config     Config
+	mutex      = &sync.RWMutex{}
 )
+
+type Config struct {
+	Routes        map[string]string
+	Transfers     map[string][]string
+	DefaultServer string
+}
+
+func (c *Config) getConf() *Config {
+	mutex.Lock()
+	defer mutex.Unlock()
+	yamlFile, err := ioutil.ReadFile(*configFile)
+	if err != nil {
+		log.Fatalf("yamlFile.Get err   #%v ", err)
+	}
+	err = yaml.Unmarshal(yamlFile, c)
+	if err != nil {
+		log.Fatalf("Unmarshal: %v", err)
+	}
+
+	return c
+}
 
 func main() {
 	flag.Parse()
-	if *defaultServer == "" {
-		log.Fatal("-default is required")
-	}
-	transferIPs = strings.Split(*allowTransfer, ",")
-	routes = make(map[string]string)
-	if *routeList != "" {
-		for _, s := range strings.Split(*routeList, ",") {
-			s := strings.SplitN(s, "=", 2)
-			if len(s) != 2 {
-				log.Fatal("invalid -routes format")
-			}
-			if !strings.HasSuffix(s[0], ".") {
-				s[0] += "."
-			}
-			routes[s[0]] = s[1]
-		}
-	}
+	config.getConf()
 
-	udpServer := &dns.Server{Addr: *address, Net: "udp"}
-	tcpServer := &dns.Server{Addr: *address, Net: "tcp"}
+	udpServer := &dns.Server{Addr: *bind, Net: "udp"}
+	tcpServer := &dns.Server{Addr: *bind, Net: "tcp"}
 	dns.HandleFunc(".", route)
 	go func() {
 		if err := udpServer.ListenAndServe(); err != nil {
@@ -75,6 +57,16 @@ func main() {
 	go func() {
 		if err := tcpServer.ListenAndServe(); err != nil {
 			log.Fatal(err)
+		}
+	}()
+
+	// SIGHUP reload config
+	reloadSignal := make(chan os.Signal, 1)
+	signal.Notify(reloadSignal, syscall.SIGHUP)
+	go func() {
+		for {
+			<-reloadSignal
+			config.getConf()
 		}
 	}()
 
@@ -92,13 +84,14 @@ func route(w dns.ResponseWriter, req *dns.Msg) {
 		dns.HandleFailed(w, req)
 		return
 	}
-	for name, addr := range routes {
-		if strings.HasSuffix(req.Question[0].Name, name) {
-			proxy(addr, w, req)
-			return
-		}
+
+	mutex.RLock()
+	defer mutex.RUnlock()
+	if addr, ok := config.Routes[req.Question[0].Name]; ok {
+		proxy(addr, w, req)
+		return
 	}
-	proxy(*defaultServer, w, req)
+	proxy(config.DefaultServer, w, req)
 }
 
 func isTransfer(req *dns.Msg) bool {
@@ -115,8 +108,11 @@ func allowed(w dns.ResponseWriter, req *dns.Msg) bool {
 	if !isTransfer(req) {
 		return true
 	}
+
+	mutex.RLock()
+	defer mutex.RUnlock()
 	remote, _, _ := net.SplitHostPort(w.RemoteAddr().String())
-	for _, ip := range transferIPs {
+	for _, ip := range config.Transfers[req.Question[0].Name] {
 		if ip == remote {
 			return true
 		}
