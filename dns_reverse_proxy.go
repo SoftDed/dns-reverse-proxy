@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	configFile = flag.String("config", "/etc/dns-proxy.yaml", "The path to the file containing the list of routes and allow transfers")
+	configFile = flag.String("config", "/usr/local/etc/dns-proxy.yaml", "The path to the file containing the list of routes and allow transfers")
 	bind       = flag.String("bind", "127.0.0.1:53", "IP:PORT bind proxy")
-	config     Config
+	config     *Config
 	mutex      = &sync.RWMutex{}
 )
 
@@ -27,24 +27,26 @@ type Config struct {
 	DefaultServer string
 }
 
-func (c *Config) getConf() *Config {
+func getConf() *Config {
 	mutex.Lock()
 	defer mutex.Unlock()
+
+	var newConfig *Config
 	yamlFile, err := ioutil.ReadFile(*configFile)
 	if err != nil {
 		log.Fatalf("yamlFile.Get err   #%v ", err)
 	}
-	err = yaml.Unmarshal(yamlFile, c)
+	err = yaml.Unmarshal(yamlFile, &newConfig)
 	if err != nil {
 		log.Fatalf("Unmarshal: %v", err)
 	}
 
-	return c
+	return newConfig
 }
 
 func main() {
 	flag.Parse()
-	config.getConf()
+	config = getConf()
 
 	udpServer := &dns.Server{Addr: *bind, Net: "udp"}
 	tcpServer := &dns.Server{Addr: *bind, Net: "tcp"}
@@ -66,7 +68,7 @@ func main() {
 	go func() {
 		for {
 			<-reloadSignal
-			config.getConf()
+			config = getConf()
 		}
 	}()
 
